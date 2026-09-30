@@ -36,6 +36,7 @@ import {
   type ApiContract,
   type ContractStatus,
 } from '../models/contract';
+import { pendingCounts } from '../services/review-derivation';
 import { useContracts, useSaveContract } from '../services/contract-queries';
 
 type StatusFilter = ContractStatus | 'all';
@@ -73,8 +74,7 @@ export function DashboardPage() {
   const metrics = useMemo(() => {
     const data = contracts.data ?? [];
     const pending = data.reduce(
-      (sum, contract) =>
-        sum + contract.changes.filter((change) => change.reviewState === 'pending').length,
+      (sum, contract) => sum + pendingCounts(contract).total,
       0,
     );
     const breaking = data.reduce(
@@ -82,8 +82,13 @@ export function DashboardPage() {
         sum + contract.changes.filter((change) => change.compatibility === 'breaking').length,
       0,
     );
+    const stale = data.reduce(
+      (sum, contract) =>
+        sum + pendingCounts(contract).staleChanges + pendingCounts(contract).staleConsumers,
+      0,
+    );
     const consumers = data.reduce((sum, contract) => sum + contract.consumers.length, 0);
-    return { pending, breaking, consumers, total: data.length };
+    return { pending, breaking, stale, consumers, total: data.length };
   }, [contracts.data]);
 
   async function importContract() {
@@ -106,9 +111,12 @@ export function DashboardPage() {
         protocol: 'REST',
         status: 'draft',
         updatedAt: now,
+        revision: 1,
+        definitionRevision: 1,
         openapi: JSON.stringify(parsed, null, 2),
         changes: [],
         consumers: [],
+        confirmations: [],
         exemptions: [],
         versions: [],
       };
@@ -174,7 +182,7 @@ export function DashboardPage() {
 
       <section className="mb-5 grid gap-px overflow-hidden rounded-lg border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="管理契约" value={metrics.total} note="REST 接口定义" icon={Boxes} />
-        <Metric label="待评审变化" value={metrics.pending} note="需要逐条结论" icon={GitBranch} />
+        <Metric label="待确认项" value={metrics.pending} note={`含 ${metrics.stale} 项被定义冲掉需重提`} icon={GitBranch} />
         <Metric
           label="不兼容变化"
           value={metrics.breaking}
@@ -252,9 +260,7 @@ export function DashboardPage() {
                 </thead>
                 <tbody>
                   {filtered.map((contract) => {
-                    const pending = contract.changes.filter(
-                      (change) => change.reviewState === 'pending',
-                    ).length;
+                    const counts = pendingCounts(contract);
                     const breaking = contract.changes.filter(
                       (change) => change.compatibility === 'breaking',
                     ).length;
@@ -274,9 +280,14 @@ export function DashboardPage() {
                         </td>
                         <td className="px-4 py-4">
                           <div className="flex flex-wrap gap-1.5">
-                            <Badge tone={pending ? 'amber' : 'green'}>
-                              {pending ? `${pending} 待评审` : '评审完成'}
+                            <Badge tone={counts.total ? 'amber' : 'green'}>
+                              {counts.total ? `${counts.total} 待确认` : '结论与确认齐备'}
                             </Badge>
+                            {counts.staleChanges + counts.staleConsumers > 0 && (
+                              <Badge tone="red">
+                                {counts.staleChanges + counts.staleConsumers} 项失效重提
+                              </Badge>
+                            )}
                             {breaking > 0 && <Badge tone="red">{breaking} 不兼容</Badge>}
                           </div>
                         </td>

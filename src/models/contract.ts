@@ -8,6 +8,17 @@ export type ChangeKind =
   | 'error_code_removed';
 export type Compatibility = 'compatible' | 'warning' | 'breaking';
 export type ReviewState = 'pending' | 'accepted' | 'returned' | 'exemption';
+export type ConfirmationState = 'confirmed' | 'pending';
+
+/** 被定义变更冲掉的旧结论，仅用于审计留痕，不参与发布门禁 */
+export interface ArchivedConclusion {
+  reviewState: ReviewState;
+  reviewer: string;
+  reviewComment: string;
+  reviewedAt: string;
+  definitionRevision: number;
+  archivedAt: string;
+}
 
 export interface ContractChange {
   id: string;
@@ -24,20 +35,51 @@ export interface ContractChange {
   reviewer: string;
   reviewComment: string;
   reviewedAt?: string;
+  /** 结论所针对的定义修订号；低于当前值时结论已失效 */
+  definitionRevision: number;
+  /** 定义变更前归档的历史结论，按时间倒序 */
+  history: ArchivedConclusion[];
 }
 
-export interface ApiConsumer {
-  id: string;
-  name: string;
-  owner: string;
-  environment: '生产' | '预发' | '灰度';
-  clientVersion: string;
-  requestsPerDay: number;
-  contact: string;
+/** 调用方对当前定义的确认 */
+export interface ConsumerConfirmation {
+  consumerId: string;
+  state: ConfirmationState;
+  confirmer: string;
+  comment: string;
+  definitionRevision: number;
+  confirmedAt?: string;
 }
 
 export interface Exemption {
   id: string;
+  changeId: string;
+  scope: string;
+  reason: string;
+  approvedBy: string;
+  expiresAt: string;
+  definitionRevision: number;
+}
+
+/** 进入不可变版本的结论快照 */
+export interface ChangeSnapshot {
+  changeId: string;
+  reviewState: ReviewState;
+  reviewer: string;
+  reviewComment: string;
+  reviewedAt?: string;
+  definitionRevision: number;
+}
+
+export interface ConfirmationSnapshot {
+  consumerId: string;
+  confirmer: string;
+  comment: string;
+  definitionRevision: number;
+  confirmedAt?: string;
+}
+
+export interface ExemptionSnapshot {
   changeId: string;
   scope: string;
   reason: string;
@@ -53,7 +95,16 @@ export interface ContractVersion {
   checksum: string;
   notes: string;
   changeIds: string[];
+  /** 发布时的定义修订号，工作副本继续演进后可据此比较 */
+  definitionRevision: number;
+  /** 不可变定义快照 */
   openapi: string;
+  /** 发布时仍有效的逐条结论快照 */
+  changes: ChangeSnapshot[];
+  /** 发布时调用方确认快照 */
+  confirmations: ConfirmationSnapshot[];
+  /** 发布时有效的豁免快照 */
+  exemptions: ExemptionSnapshot[];
 }
 
 export interface ApiContract {
@@ -65,11 +116,26 @@ export interface ApiContract {
   protocol: 'REST' | 'GraphQL' | 'gRPC-Web';
   status: ContractStatus;
   updatedAt: string;
+  /** 乐观并发版本：任意一次成功保存都会递增 */
+  revision: number;
+  /** 定义修订号：仅当 OpenAPI 定义变化时递增，结论与确认绑定该号 */
+  definitionRevision: number;
   openapi: string;
   changes: ContractChange[];
   consumers: ApiConsumer[];
+  confirmations: ConsumerConfirmation[];
   exemptions: Exemption[];
   versions: ContractVersion[];
+}
+
+export interface ApiConsumer {
+  id: string;
+  name: string;
+  owner: string;
+  environment: '生产' | '预发' | '灰度';
+  clientVersion: string;
+  requestsPerDay: number;
+  contact: string;
 }
 
 export interface ReleaseIssue {
@@ -78,6 +144,7 @@ export interface ReleaseIssue {
   title: string;
   detail: string;
   changeId?: string;
+  consumerId?: string;
 }
 
 export const CHANGE_KIND_LABELS: Record<ChangeKind, string> = {
@@ -161,9 +228,40 @@ export function classifyChange(input: {
   }
 }
 
+/** 结论是否仍对当前定义有效 */
+export function isConclusionCurrent(change: ContractChange, contract: ApiContract): boolean {
+  return change.definitionRevision >= contract.definitionRevision;
+}
+
+/** 调用方确认是否仍对当前定义有效 */
+export function isConfirmationCurrent(
+  confirmation: ConsumerConfirmation,
+  contract: ApiContract,
+): boolean {
+  return (
+    confirmation.state === 'confirmed' &&
+    confirmation.definitionRevision >= contract.definitionRevision
+  );
+}
+
 export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
   const issues: ReleaseIssue[] = [];
-  const pending = contract.changes.filter((change) => change.reviewState === 'pending');
+  const staleChanges = contract.changes.filter(
+    (change) => !isConclusionCurrent(change, contract),
+  );
+  staleChanges.forEach((change) => {
+    issues.push({
+      id: `stale-${change.id}`,
+      severity: 'blocker',
+      title: '结论已被定义变更冲掉',
+      detail: `${change.method} ${change.path} 的结论基于第 ${change.definitionRevision} 版定义，定义已更新到第 ${contract.definitionRevision} 版，需要重新确认。`,
+      changeId: change.id,
+    });
+  });
+
+  const pending = contract.changes.filter(
+    (change) => isConclusionCurrent(change, contract) && change.reviewState === 'pending',
+  );
   pending.forEach((change) => {
     issues.push({
       id: `pending-${change.id}`,
@@ -175,7 +273,10 @@ export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
   });
 
   contract.changes
-    .filter((change) => change.reviewState !== 'exemption')
+    .filter(
+      (change) =>
+        isConclusionCurrent(change, contract) && change.reviewState !== 'exemption',
+    )
     .forEach((change) => {
       if (change.compatibility === 'compatible') {
         return;
@@ -200,9 +301,25 @@ export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
       }
     });
 
+  contract.consumers.forEach((consumer) => {
+    const confirmation = contract.confirmations.find(
+      (item) => item.consumerId === consumer.id,
+    );
+    if (!confirmation || !isConfirmationCurrent(confirmation, contract)) {
+      issues.push({
+        id: `consumer-${consumer.id}`,
+        severity: 'blocker',
+        title: '调用方尚未确认当前定义',
+        detail: `${consumer.name}（${consumer.environment} · ${consumer.clientVersion}）还没有针对第 ${contract.definitionRevision} 版定义给出确认。`,
+        consumerId: consumer.id,
+      });
+    }
+  });
+
   contract.changes
     .filter(
       (change) =>
+        isConclusionCurrent(change, contract) &&
         change.compatibility === 'breaking' &&
         change.reviewState === 'accepted' &&
         !contract.exemptions.some((item) => item.changeId === change.id),

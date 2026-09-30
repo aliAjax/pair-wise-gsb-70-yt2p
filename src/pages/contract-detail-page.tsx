@@ -9,12 +9,13 @@ import {
   GitCompare,
   Layers3,
   LockKeyhole,
+  RefreshCcw,
   Users,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { ChangeReviewItem } from '../components/contract/change-review-item';
 import { CompatibilityBadge } from '../components/contract/compatibility-badge';
-import { ConsumerTable } from '../components/contract/consumer-table';
+import { ConsumerConfirmationPanel } from '../components/contract/consumer-confirmation-panel';
 import { ContractEditor } from '../components/contract/contract-editor';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -33,6 +34,7 @@ import { Textarea } from '../components/ui/textarea';
 import { formatDateTime } from '../lib/utils';
 import {
   REVIEW_STATE_LABELS,
+  isConclusionCurrent,
   type ApiContract,
   type ContractChange,
   type ReviewState,
@@ -45,12 +47,19 @@ import {
 } from '../services/contract-service';
 import {
   useAddExemption,
+  useConfirmConsumer,
   useContract,
   useFreezeVersion,
   useReviewChange,
-  useSaveContract,
-  useUpdateOpenApi,
+  useSaveChanges,
+  useSaveDefinition,
 } from '../services/contract-queries';
+import {
+  latestVersion,
+  pendingConsumers,
+  releaseGate,
+} from '../services/review-derivation';
+import { useConflictStore } from '../store/conflict-store';
 import { useReviewStore } from '../store/review-store';
 
 export function ContractDetailPage() {
@@ -60,28 +69,59 @@ export function ContractDetailPage() {
   const setActiveTab = useReviewStore((state) => state.setActiveTab);
   const reviewChange = useReviewChange();
   const addExemption = useAddExemption();
-  const updateOpenApi = useUpdateOpenApi();
-  const saveContract = useSaveContract();
+  const confirmConsumerMutation = useConfirmConsumer();
+  const saveDefinition = useSaveDefinition();
+  const saveChanges = useSaveChanges();
   const freezeVersion = useFreezeVersion();
+  const reportConflict = useConflictStore((state) => state.reportConflict);
   const [releaseVersion, setReleaseVersion] = useState('');
   const [releaseNotes, setReleaseNotes] = useState('');
   const [reviewFilter, setReviewFilter] = useState<ReviewState | 'all'>('all');
   const [selectedVersionId, setSelectedVersionId] = useState('');
+  /** 发布幂等键：同一次发布流程内固定，重试不会产生第二个版本 */
+  const [releaseKey, setReleaseKey] = useState(() => cryptoRandomKey());
 
   const contract = contractQuery.data;
+  const gate = useMemo(
+    () => (contract ? releaseGate(contract) : null),
+    [contract],
+  );
   const issues = useMemo(
     () => (contract ? validateForRelease(contract) : []),
     [contract],
   );
-  const blockers = issues.filter((issue) => issue.severity === 'blocker').length;
-  const warnings = issues.filter((issue) => issue.severity === 'warning').length;
-  const acceptedCount = contract?.changes.filter((change) => change.reviewState !== 'pending').length ?? 0;
-  const reviewProgress = contract?.changes.length
-    ? Math.round((acceptedCount / contract.changes.length) * 100)
+  const blockers = gate?.blockers.length ?? 0;
+  const warnings = gate?.warnings.length ?? 0;
+  const currentChangeCount = contract
+    ? contract.changes.filter((change) => isConclusionCurrent(change, contract)).length
+    : 0;
+  const acceptedCount = contract
+    ? contract.changes.filter(
+        (change) =>
+          isConclusionCurrent(change, contract) && change.reviewState !== 'pending',
+      ).length
+    : 0;
+  const confirmedCount = contract
+    ? contract.consumers.filter((consumer) => {
+        const confirmation = contract.confirmations.find(
+          (item) => item.consumerId === consumer.id,
+        );
+        return (
+          confirmation?.state === 'confirmed' &&
+          confirmation.definitionRevision >= contract.definitionRevision
+        );
+      }).length
+    : 0;
+  const reviewProgress = currentChangeCount
+    ? Math.round((acceptedCount / currentChangeCount) * 100)
     : 100;
+  const staleCount = contract
+    ? contract.changes.filter((change) => !isConclusionCurrent(change, contract))
+        .length + pendingConsumers(contract).length
+    : 0;
+  const finalVersion = contract ? latestVersion(contract) : undefined;
   const selectedVersion =
-    contract?.versions.find((version) => version.id === selectedVersionId) ??
-    contract?.versions[0];
+    contract?.versions.find((version) => version.id === selectedVersionId) ?? finalVersion;
 
   if (contractQuery.isLoading) {
     return <PageState text="正在加载契约详情..." />;
@@ -98,44 +138,116 @@ export function ContractDetailPage() {
     );
   }
   const currentContract = contract;
+  const revision = contract.revision;
+
+  async function withConflict<T>(action: () => Promise<T>, summary?: string): Promise<T> {
+    try {
+      return await action();
+    } catch (error) {
+      reportConflict(error, summary);
+      throw error;
+    }
+  }
 
   async function updateChange(changeId: string, patch: Partial<ContractChange>) {
-    if (!contract) return;
-    await saveContract.mutateAsync({
-      ...contract,
-      changes: contract.changes.map((change) =>
-        change.id === changeId ? { ...change, ...patch } : change,
-      ),
-    });
+    await withConflict(
+      () =>
+        saveChanges.mutateAsync({
+          contractId,
+          expectedRevision: revision,
+          changes: currentContract.changes.map((change) =>
+            change.id === changeId ? { ...change, ...patch } : change,
+          ),
+        }),
+      `正在保存 ${changeId} 的影响说明/迁移方案`,
+    );
   }
 
   async function handleReview(changeId: string, state: ReviewState, comment: string) {
-    await reviewChange.mutateAsync({
-      contractId,
-      changeId,
-      state,
-      reviewer: '当前评审人',
-      comment,
-    });
+    await withConflict(
+      () =>
+        reviewChange.mutateAsync({
+          contractId,
+          changeId,
+          state,
+          reviewer: '当前评审人',
+          comment,
+          expectedRevision: revision,
+        }),
+      `正在提交 ${changeId} 的评审结论：${state}`,
+    );
   }
 
-  async function handleExemption(changeId: string, reason: string) {
-    await addExemption.mutateAsync({ contractId, changeId, reason });
+  async function handleExemption(input: {
+    changeId: string;
+    scope: string;
+    reason: string;
+    expiresAt: string;
+  }) {
+    await withConflict(
+      () =>
+        addExemption.mutateAsync({
+          contractId,
+          changeId: input.changeId,
+          scope: input.scope,
+          reason: input.reason,
+          approvedBy: '当前评审人',
+          expiresAt: input.expiresAt,
+          expectedRevision: revision,
+        }),
+      `正在为 ${input.changeId} 登记豁免：${input.scope}`,
+    );
   }
 
   async function saveOpenApi(value: string) {
-    await updateOpenApi.mutateAsync({ contractId, openapi: value });
+    await withConflict(
+      () =>
+        saveDefinition.mutateAsync({
+          contractId,
+          expectedRevision: revision,
+          openapi: value,
+        }),
+      value.slice(0, 400),
+    );
+  }
+
+  async function handleConsumerConfirm(input: {
+    consumerId: string;
+    confirmed: boolean;
+    confirmer: string;
+    comment: string;
+  }) {
+    await withConflict(
+      () =>
+        confirmConsumerMutation.mutateAsync({
+          contractId,
+          consumerId: input.consumerId,
+          confirmed: input.confirmed,
+          confirmer: input.confirmer,
+          comment: input.comment,
+          expectedRevision: revision,
+        }),
+      `正在保存调用方 ${input.consumerId} 的确认`,
+    );
   }
 
   async function freeze() {
     if (!releaseVersion.trim()) return;
-    await freezeVersion.mutateAsync({
-      contractId,
-      version: releaseVersion.trim(),
-      notes: releaseNotes.trim() || '本版契约变更评审完成。',
-    });
-    setReleaseVersion('');
-    setReleaseNotes('');
+    try {
+      await freezeVersion.mutateAsync({
+        contractId,
+        expectedRevision: revision,
+        version: releaseVersion.trim(),
+        notes: releaseNotes.trim() || '本版契约变更评审完成。',
+        idempotencyKey: releaseKey,
+      });
+      setReleaseVersion('');
+      setReleaseNotes('');
+      setReleaseKey(cryptoRandomKey());
+    } catch (error) {
+      // 发布冲突/门禁失败同样提示；幂等键保留，用户可直接重试
+      reportConflict(error, `发布 v${releaseVersion.trim()}`);
+    }
   }
 
   function exportReport() {
@@ -155,8 +267,15 @@ export function ContractDetailPage() {
   }
 
   const filteredChanges = contract.changes.filter(
-    (change) => reviewFilter === 'all' || change.reviewState === reviewFilter,
+    (change) => reviewFilter === 'all' || change.reviewState === reviewFilter ||
+      (reviewFilter === 'pending' && !isConclusionCurrent(change, contract)),
   );
+  const anyMutationPending =
+    saveDefinition.isPending ||
+    saveChanges.isPending ||
+    reviewChange.isPending ||
+    addExemption.isPending ||
+    confirmConsumerMutation.isPending;
 
   return (
     <div>
@@ -175,17 +294,24 @@ export function ContractDetailPage() {
               <span className="font-mono text-xs text-sky-800">{contract.protocol}</span>
               <Badge tone="slate">v{contract.version}</Badge>
               <StatusPill status={contract.status} />
+              {staleCount > 0 && <Badge tone="amber">{staleCount} 项待重新确认</Badge>}
+              {finalVersion && <Badge tone="green">最终版本 v{finalVersion.version}</Badge>}
             </div>
             <h1 className="mt-2 text-2xl font-semibold text-slate-950 sm:text-3xl">
               {contract.name}
             </h1>
             <p className="mt-2 text-sm text-slate-600">
-              {contract.domain} · 负责人 {contract.owner} · 更新 {formatDateTime(contract.updatedAt)}
+              {contract.domain} · 负责人 {contract.owner} · 定义第 {contract.definitionRevision}{' '}
+              版 · 保存修订 r{contract.revision} · 更新 {formatDateTime(contract.updatedAt)}
             </p>
           </div>
           <div className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-slate-200 bg-slate-200">
-            <HeaderMetric label="变更项" value={String(contract.changes.length)} />
-            <HeaderMetric label="调用方" value={String(contract.consumers.length)} />
+            <HeaderMetric label="待确认项" value={String(staleCount)} danger={!!staleCount} />
+            <HeaderMetric
+              label="调用方确认"
+              value={`${confirmedCount}/${contract.consumers.length}`}
+              danger={confirmedCount < contract.consumers.length}
+            />
             <HeaderMetric label="发布门禁" value={blockers ? `${blockers} 阻断` : '通过'} danger={!!blockers} />
           </div>
         </div>
@@ -208,27 +334,62 @@ export function ContractDetailPage() {
         <TabsContent value="overview">
           <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
             <ContractEditor
-              key={`${contract.id}-${contract.openapi}`}
               contract={contract}
-              onSave={(value) => void saveOpenApi(value)}
-              saving={updateOpenApi.isPending}
+              onSave={(value) => saveOpenApi(value)}
+              saving={saveDefinition.isPending}
+              draftKey={contract.id}
             />
             <div className="space-y-4">
               <Card>
                 <CardHeader>
-                  <CardTitle>评审进度</CardTitle>
+                  <CardTitle>评审进度（当前定义）</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="flex items-end justify-between">
                     <div>
                       <span className="text-3xl font-semibold">{reviewProgress}%</span>
                       <p className="mt-1 text-xs text-slate-500">
-                        {acceptedCount} / {contract.changes.length} 项已有结论
+                        {acceptedCount} / {currentChangeCount} 条结论有效
                       </p>
                     </div>
                     {!blockers && <CheckCircle2 className="h-6 w-6 text-emerald-600" />}
                   </div>
                   <Progress className="mt-4" value={reviewProgress} />
+                  {staleCount > 0 && (
+                    <p className="mt-3 rounded bg-amber-50 px-2 py-1.5 text-[11px] leading-5 text-amber-800">
+                      {contract.changes.filter((change) => !isConclusionCurrent(change, contract)).length}{' '}
+                      条旧结论与 {pendingConsumers(contract).length} 方调用方确认已被定义更新冲掉，需重新确认。
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>调用方确认</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-600">已确认当前定义</span>
+                    <strong>
+                      {confirmedCount} / {contract.consumers.length}
+                    </strong>
+                  </div>
+                  {finalVersion && (
+                    <div className="flex items-center justify-between border-t border-slate-100 pt-2">
+                      <span className="text-slate-600">最终版本</span>
+                      <strong>v{finalVersion.version}</strong>
+                    </div>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-1 w-full"
+                    onClick={() => setActiveTab('consumers')}
+                  >
+                    <Users className="h-3.5 w-3.5" />
+                    去确认调用方
+                  </Button>
                 </CardContent>
               </Card>
 
@@ -272,7 +433,7 @@ export function ContractDetailPage() {
               <div>
                 <CardTitle>字段与错误码差异</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  每种变化必须逐条接受、退回或申请兼容层
+                  每种变化必须逐条接受、退回或申请兼容层；定义一变，旧结论自动失效需重新确认
                 </p>
               </div>
               <Select
@@ -295,13 +456,17 @@ export function ContractDetailPage() {
             <CardContent className="p-0">
               {filteredChanges.map((change) => (
                 <ChangeReviewItem
-                  key={`${change.id}-${change.reviewState}-${change.impactStatement}-${change.migrationPlan}`}
+                  key={change.id}
+                  contractId={contract.id}
                   change={change}
+                  currentDefinitionRevision={contract.definitionRevision}
+                  serverRevision={contract.revision}
+                  saving={anyMutationPending}
                   onReview={(changeId, state, comment) =>
-                    void handleReview(changeId, state, comment)
+                    handleReview(changeId, state, comment).catch(() => undefined)
                   }
-                  onUpdate={(changeId, patch) => void updateChange(changeId, patch)}
-                  onExemption={(changeId, reason) => void handleExemption(changeId, reason)}
+                  onUpdate={(changeId, patch) => updateChange(changeId, patch)}
+                  onExemption={(input) => handleExemption(input).catch(() => undefined)}
                 />
               ))}
               {!filteredChanges.length && (
@@ -314,13 +479,21 @@ export function ContractDetailPage() {
         <TabsContent value="consumers">
           <Card>
             <CardHeader>
-              <CardTitle>依赖调用方列表</CardTitle>
+              <CardTitle>调用方确认</CardTitle>
               <p className="mt-1 text-xs text-slate-500">
-                用于判断一次契约变化影响的客户端、环境与流量规模
+                每个调用方必须针对当前定义修订给出确认；定义更新后旧确认自动失效，需要重新确认
               </p>
             </CardHeader>
             <CardContent className="p-0">
-              <ConsumerTable consumers={contract.consumers} />
+              <ConsumerConfirmationPanel
+                contractId={contract.id}
+                consumers={contract.consumers}
+                confirmations={contract.confirmations}
+                currentDefinitionRevision={contract.definitionRevision}
+                serverRevision={contract.revision}
+                saving={confirmConsumerMutation.isPending}
+                onConfirm={handleConsumerConfirm}
+              />
             </CardContent>
           </Card>
         </TabsContent>
@@ -331,7 +504,7 @@ export function ContractDetailPage() {
               <CardHeader>
                 <CardTitle>发布前门禁</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  {blockers} 个阻断项，{warnings} 个警告
+                  {blockers} 个阻断项，{warnings} 个警告。与评审队列、变更报告展示同一批待确认项
                 </p>
               </CardHeader>
               <CardContent>
@@ -357,7 +530,7 @@ export function ContractDetailPage() {
                 ))}
                 {!issues.length && (
                   <div className="rounded-md border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-                    所有变更评审和迁移约束均已满足，可以冻结正式版本。
+                    所有变更评审、调用方确认和迁移约束均已满足，可以冻结正式版本。
                   </div>
                 )}
               </CardContent>
@@ -367,10 +540,17 @@ export function ContractDetailPage() {
               <CardHeader>
                 <CardTitle>冻结正式版本</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  冻结后版本定义不可覆盖，并保留校验值
+                  定义、有效结论、调用方确认和豁免一次性生成不可改快照；保存失败可用同一发布重试，不会留下半个版本
                 </p>
               </CardHeader>
               <CardContent>
+                <div className="mb-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-[11px] leading-5 text-slate-600">
+                  <div>快照绑定：定义第 {contract.definitionRevision} 版 · 修订 r{revision}</div>
+                  <div>
+                    有效结论 {acceptedCount} 条 · 调用方确认 {confirmedCount}/
+                    {contract.consumers.length} · 豁免 {contract.exemptions.length} 条
+                  </div>
+                </div>
                 <label className="text-xs font-medium text-slate-700">版本号</label>
                 <Input
                   className="mt-1.5"
@@ -391,8 +571,14 @@ export function ContractDetailPage() {
                   onClick={() => void freeze()}
                 >
                   <LockKeyhole className="h-4 w-4" />
-                  {freezeVersion.isPending ? '冻结中' : '确认发布并冻结'}
+                  {freezeVersion.isPending ? '冻结中（可安全重试）' : '确认发布并冻结'}
                 </Button>
+                {freezeVersion.isError && (
+                  <p className="mt-2 flex items-start gap-1 text-[11px] leading-5 text-red-700">
+                    <RefreshCcw className="mt-0.5 h-3 w-3 shrink-0" />
+                    本次发布未完成，版本没有落盘。再次点击会用同一发布请求重试，不会产生重复版本。
+                  </p>
+                )}
               </CardContent>
             </Card>
           </div>
@@ -400,10 +586,10 @@ export function ContractDetailPage() {
 
         <TabsContent value="history">
           {selectedVersion ? (
-            <div className="grid gap-4 xl:grid-cols-[320px_1fr]">
+            <div className="grid gap-4 xl:grid-cols-[300px_360px_1fr]">
               <Card>
                 <CardHeader>
-                  <CardTitle>正式版本</CardTitle>
+                  <CardTitle>正式版本（不可变快照）</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
                   {contract.versions.map((version) => (
@@ -411,7 +597,7 @@ export function ContractDetailPage() {
                       key={version.id}
                       type="button"
                       className={
-                        selectedVersion.id === version.id
+                        selectedVersion?.id === version.id
                           ? 'w-full rounded-md border border-sky-300 bg-sky-50 p-3 text-left'
                           : 'w-full rounded-md border border-slate-200 p-3 text-left hover:bg-slate-50'
                       }
@@ -424,10 +610,57 @@ export function ContractDetailPage() {
                         </span>
                       </div>
                       <p className="mt-2 text-xs leading-5 text-slate-600">{version.notes}</p>
+                      <div className="mt-2 flex flex-wrap gap-1 text-[10px] text-slate-500">
+                        <Badge tone="neutral">定义第 {version.definitionRevision} 版</Badge>
+                        <Badge tone="neutral">结论 {version.changes.length}</Badge>
+                        <Badge tone="neutral">确认 {version.confirmations.length}</Badge>
+                        <Badge tone="neutral">豁免 {version.exemptions.length}</Badge>
+                      </div>
                     </button>
                   ))}
                   {!contract.versions.length && (
                     <p className="py-8 text-center text-sm text-slate-500">尚无正式版本。</p>
+                  )}
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle>随版冻结内容</CardTitle>
+                  <p className="mt-1 whitespace-pre-line text-xs text-slate-500">
+                    {selectedVersion ? diffVersionSummary(contract) : ''}
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {selectedVersion && (
+                    <>
+                      <SnapshotList
+                        title="有效结论"
+                        empty="本版无随版结论"
+                        items={selectedVersion.changes.map((item) => ({
+                          id: item.changeId,
+                          primary: item.changeId,
+                          secondary: `${item.reviewState} · ${item.reviewer || '未署名'} · 定义第 ${item.definitionRevision} 版`,
+                        }))}
+                      />
+                      <SnapshotList
+                        title="调用方确认"
+                        empty="本版无调用方确认"
+                        items={selectedVersion.confirmations.map((item) => ({
+                          id: item.consumerId,
+                          primary: item.consumerId,
+                          secondary: `${item.confirmer} · 定义第 ${item.definitionRevision} 版`,
+                        }))}
+                      />
+                      <SnapshotList
+                        title="豁免"
+                        empty="本版无豁免"
+                        items={selectedVersion.exemptions.map((item) => ({
+                          id: `${item.changeId}-${item.scope}`,
+                          primary: item.scope,
+                          secondary: `${item.reason} · 至 ${item.expiresAt} · ${item.approvedBy}`,
+                        }))}
+                      />
+                    </>
                   )}
                 </CardContent>
               </Card>
@@ -498,14 +731,24 @@ export function ContractDetailPage() {
                     value={`${contract.changes.length} 项`}
                   />
                   <ReportFact
+                    icon={Clock3}
+                    label="待确认项"
+                    value={`${staleCount} 项`}
+                  />
+                  <ReportFact
                     icon={Users}
                     label="调用方影响"
-                    value={`${contract.consumers.length} 个客户端`}
+                    value={`${confirmedCount}/${contract.consumers.length} 已确认`}
                   />
                   <ReportFact
                     icon={Layers3}
                     label="兼容层豁免"
                     value={`${contract.exemptions.length} 条`}
+                  />
+                  <ReportFact
+                    icon={LockKeyhole}
+                    label="最终版本"
+                    value={finalVersion ? `v${finalVersion.version}` : '尚未发布'}
                   />
                 </CardContent>
               </Card>
@@ -598,4 +841,46 @@ function downloadText(filename: string, content: string, type: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+function cryptoRandomKey(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `key-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function SnapshotList({
+  title,
+  empty,
+  items,
+}: {
+  title: string;
+  empty: string;
+  items: Array<{ id: string; primary: string; secondary: string }>;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 text-xs font-semibold text-slate-700">
+        {title}（{items.length}）
+      </div>
+      {items.length ? (
+        <ul className="space-y-1">
+          {items.map((item) => (
+            <li
+              key={item.id}
+              className="rounded border border-slate-100 bg-slate-50 px-2 py-1.5"
+            >
+              <div className="font-mono text-[11px] font-semibold text-slate-800">
+                {item.primary}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">{item.secondary}</div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[11px] text-slate-400">{empty}</p>
+      )}
+    </div>
+  );
 }

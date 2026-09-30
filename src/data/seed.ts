@@ -69,6 +69,8 @@ function change(
     reviewState: 'pending',
     reviewer: '',
     reviewComment: '',
+    definitionRevision: 1,
+    history: [],
     ...overrides,
   };
 }
@@ -122,6 +124,8 @@ export const seedContracts: ApiContract[] = [
     protocol: 'REST',
     status: 'review',
     updatedAt: '2026-09-29T03:12:00.000Z',
+    revision: 7,
+    definitionRevision: 2,
     openapi: orderOpenApi,
     changes: [
       change(
@@ -136,6 +140,7 @@ export const seedContracts: ApiContract[] = [
           reviewer: '林墨',
           reviewComment: '可选响应字段，旧客户端忽略即可。',
           reviewedAt: '2026-09-29T02:10:00.000Z',
+          definitionRevision: 2,
         },
       ),
       change(
@@ -148,7 +153,21 @@ export const seedContracts: ApiContract[] = [
         {
           impactStatement: '取消订单客户端 12 个，其中 3 个生产调用方尚未升级。',
           migrationPlan: '发布前完成三个调用方灰度升级，兼容层保留 30 天。',
-          reviewState: 'pending',
+          reviewState: 'accepted',
+          reviewer: '林墨',
+          reviewComment: '第 1 版定义下已接受；定义更新后需重新确认。',
+          reviewedAt: '2026-09-28T09:00:00.000Z',
+          definitionRevision: 1,
+          history: [
+            {
+              reviewState: 'accepted',
+              reviewer: '林墨',
+              reviewComment: '第 1 版定义下已接受。',
+              reviewedAt: '2026-09-28T09:00:00.000Z',
+              definitionRevision: 1,
+              archivedAt: '2026-09-29T03:12:00.000Z',
+            },
+          ],
         },
       ),
       change(
@@ -165,6 +184,7 @@ export const seedContracts: ApiContract[] = [
           reviewer: '周言',
           reviewComment: '影响说明完整，允许进入兼容层观察。',
           reviewedAt: '2026-09-29T03:01:00.000Z',
+          definitionRevision: 2,
         },
       ),
     ],
@@ -197,6 +217,30 @@ export const seedContracts: ApiContract[] = [
         contact: 'bi-api@example.com',
       },
     ],
+    confirmations: [
+      {
+        consumerId: 'consumer-app',
+        state: 'confirmed',
+        confirmer: '交易应用组 · 沈屿',
+        comment: '订单中心 4.7 已兼容 loyaltyDiscount 与 PARTIAL_REFUND。',
+        definitionRevision: 2,
+        confirmedAt: '2026-09-29T03:20:00.000Z',
+      },
+      {
+        consumerId: 'consumer-cs',
+        state: 'confirmed',
+        confirmer: '服务体验组 · 何晚',
+        comment: '客服工作台已适配新状态展示。',
+        definitionRevision: 1,
+      },
+      {
+        consumerId: 'consumer-bi',
+        state: 'pending',
+        confirmer: '',
+        comment: '',
+        definitionRevision: 2,
+      },
+    ],
     exemptions: [
       {
         id: 'ex-order-1',
@@ -205,6 +249,7 @@ export const seedContracts: ApiContract[] = [
         reason: '三个遗留调用方需要分阶段升级，兼容层临时允许缺失。',
         approvedBy: '付航',
         expiresAt: '2026-10-31',
+        definitionRevision: 2,
       },
     ],
     versions: [
@@ -216,7 +261,11 @@ export const seedContracts: ApiContract[] = [
         checksum: 'a18d73f2',
         notes: '新增批量查询能力。',
         changeIds: [],
+        definitionRevision: 1,
         openapi: orderOpenApi.replaceAll('2.8.0', '2.7.0'),
+        changes: [],
+        confirmations: [],
+        exemptions: [],
       },
     ],
   },
@@ -229,6 +278,8 @@ export const seedContracts: ApiContract[] = [
     protocol: 'REST',
     status: 'ready',
     updatedAt: '2026-09-28T10:40:00.000Z',
+    revision: 5,
+    definitionRevision: 1,
     openapi: paymentOpenApi,
     changes: [
       change(
@@ -245,6 +296,7 @@ export const seedContracts: ApiContract[] = [
           reviewer: '韩度',
           reviewComment: '迁移方案未包含历史数据核对，退回补充。',
           reviewedAt: '2026-09-28T10:40:00.000Z',
+          definitionRevision: 1,
         },
       ),
       change(
@@ -261,6 +313,7 @@ export const seedContracts: ApiContract[] = [
           reviewer: '韩度',
           reviewComment: '影响范围清晰。',
           reviewedAt: '2026-09-28T08:20:00.000Z',
+          definitionRevision: 1,
         },
       ),
     ],
@@ -284,6 +337,24 @@ export const seedContracts: ApiContract[] = [
         contact: 'pay-ops@example.com',
       },
     ],
+    confirmations: [
+      {
+        consumerId: 'consumer-finance',
+        state: 'confirmed',
+        confirmer: '财务研发组 · 顾准',
+        comment: '对账链路已切换 paymentId，灰度一周无差异。',
+        definitionRevision: 1,
+        confirmedAt: '2026-09-28T09:00:00.000Z',
+      },
+      {
+        consumerId: 'consumer-pay-ops',
+        state: 'confirmed',
+        confirmer: '支付产品组 · 施遥',
+        comment: '运营台 RISK_HOLD 提示已上线。',
+        definitionRevision: 1,
+        confirmedAt: '2026-09-28T09:10:00.000Z',
+      },
+    ],
     exemptions: [],
     versions: [
       {
@@ -294,7 +365,11 @@ export const seedContracts: ApiContract[] = [
         checksum: 'f9ac1220',
         notes: '统一退款错误码。',
         changeIds: [],
+        definitionRevision: 1,
         openapi: paymentOpenApi.replaceAll('4.2.0', '4.1.0'),
+        changes: [],
+        confirmations: [],
+        exemptions: [],
       },
     ],
   },
@@ -307,6 +382,8 @@ export const seedContracts: ApiContract[] = [
     protocol: 'REST',
     status: 'review',
     updatedAt: '2026-09-27T06:15:00.000Z',
+    revision: 2,
+    definitionRevision: 1,
     openapi: userOpenApi,
     changes: [
       change(
@@ -321,6 +398,7 @@ export const seedContracts: ApiContract[] = [
           reviewer: '宋川',
           reviewComment: '可选字段，不影响旧客户端。',
           reviewedAt: '2026-09-27T06:15:00.000Z',
+          definitionRevision: 1,
         },
       ),
     ],
@@ -333,6 +411,15 @@ export const seedContracts: ApiContract[] = [
         clientVersion: '1.12.3',
         requestsPerDay: 180000,
         contact: 'iam-console@example.com',
+      },
+    ],
+    confirmations: [
+      {
+        consumerId: 'consumer-admin',
+        state: 'pending',
+        confirmer: '',
+        comment: '',
+        definitionRevision: 1,
       },
     ],
     exemptions: [],

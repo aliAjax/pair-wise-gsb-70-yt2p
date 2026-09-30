@@ -7,6 +7,7 @@ import {
   Network,
   PackageCheck,
 } from 'lucide-react';
+import { ConflictDialog } from '../contract/conflict-dialog';
 import { cn } from '../../lib/utils';
 
 const navigation = [
@@ -106,6 +107,7 @@ export function AppShell() {
           <Outlet />
         </main>
       </div>
+      <ConflictDialog />
     </div>
   );
 }

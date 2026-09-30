@@ -1,4 +1,4 @@
-import { Download, FileJson, FileText, ShieldCheck } from 'lucide-react';
+import { Download, FileJson, FileText, LockKeyhole, ShieldCheck } from 'lucide-react';
 import { useMemo } from 'react';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -13,6 +13,10 @@ import {
 import { formatDateTime } from '../lib/utils';
 import { buildChangeReport } from '../services/contract-service';
 import { useContracts } from '../services/contract-queries';
+import {
+  latestVersion,
+  pendingCounts,
+} from '../services/review-derivation';
 import { useReviewStore } from '../store/review-store';
 
 export function ReportsPage() {
@@ -24,7 +28,8 @@ export function ReportsPage() {
     contracts.data?.[0];
 
   const report = useMemo(() => (contract ? buildChangeReport(contract) : ''), [contract]);
-  const reviewed = contract?.changes.filter((change) => change.reviewState !== 'pending') ?? [];
+  const pending = contract ? pendingCounts(contract) : null;
+  const finalVersion = contract ? latestVersion(contract) : undefined;
 
   return (
     <div>
@@ -90,9 +95,14 @@ export function ReportsPage() {
           {contract && (
             <div className="flex flex-wrap gap-2 sm:ml-auto">
               <Badge tone="blue">{contract.domain}</Badge>
-              <Badge tone="neutral">{contract.changes.length} 个变化</Badge>
-              <Badge tone={reviewed.length === contract.changes.length ? 'green' : 'amber'}>
-                {reviewed.length === contract.changes.length ? '评审完成' : '仍有待评审项'}
+              <Badge tone="neutral">定义第 {contract.definitionRevision} 版</Badge>
+              <Badge tone={pending && pending.total === 0 ? 'green' : 'amber'}>
+                {pending && pending.total === 0
+                  ? '待确认项已清零'
+                  : `${pending?.total ?? 0} 项待确认（含失效重提）`}
+              </Badge>
+              <Badge tone={finalVersion ? 'green' : 'neutral'}>
+                {finalVersion ? `最终版本 v${finalVersion.version}` : '尚未发布'}
               </Badge>
             </div>
           )}
@@ -153,47 +163,65 @@ export function ReportsPage() {
                 <CardTitle>评审签名</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                {contract.changes.map((change) => (
-                  <div
-                    key={change.id}
-                    className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3 last:border-0 last:pb-0"
-                  >
-                    <div>
-                      <div className="font-mono text-[11px] text-slate-600">
-                        {change.method} {change.path}
-                      </div>
-                      <div className="mt-1 text-xs text-slate-500">
-                        {change.reviewer || '尚未评审'}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <Badge
-                        tone={
-                          change.reviewState === 'accepted'
-                            ? 'green'
-                            : change.reviewState === 'returned'
-                              ? 'red'
-                              : change.reviewState === 'exemption'
-                                ? 'blue'
-                                : 'amber'
-                        }
-                      >
-                        {change.reviewState}
-                      </Badge>
-                      {change.reviewedAt && (
-                        <div className="mt-1 text-[10px] text-slate-400">
-                          {formatDateTime(change.reviewedAt)}
+                {contract.changes.map((change) => {
+                  const current = change.definitionRevision >= contract.definitionRevision;
+                  return (
+                    <div
+                      key={change.id}
+                      className={
+                        current
+                          ? 'flex items-start justify-between gap-3 border-b border-slate-100 pb-3 last:border-0 last:pb-0'
+                          : 'flex items-start justify-between gap-3 rounded border border-amber-200 bg-amber-50 p-2'
+                      }
+                    >
+                      <div>
+                        <div className="font-mono text-[11px] text-slate-600">
+                          {change.method} {change.path}
                         </div>
-                      )}
+                        <div className="mt-1 text-xs text-slate-500">
+                          {change.reviewer || '尚未评审'} · 第 {change.definitionRevision} 版结论
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <Badge tone={current ? toneOf(change.reviewState) : 'amber'}>
+                          {current ? change.reviewState : '已失效需重新确认'}
+                        </Badge>
+                        {change.reviewedAt && current && (
+                          <div className="mt-1 text-[10px] text-slate-400">
+                            {formatDateTime(change.reviewedAt)}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </CardContent>
             </Card>
 
+            {finalVersion && (
+              <Card className="border-emerald-200">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <LockKeyhole className="h-4 w-4 text-emerald-700" />
+                    最终版本 v{finalVersion.version}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-1.5 text-xs text-slate-600">
+                  <div>发布于 {formatDateTime(finalVersion.releasedAt)}</div>
+                  <div className="font-mono">校验值 {finalVersion.checksum}</div>
+                  <div>定义第 {finalVersion.definitionRevision} 版</div>
+                  <div>
+                    随版结论 {finalVersion.changes.length} 条 · 调用方确认{' '}
+                    {finalVersion.confirmations.length} 方 · 豁免{' '}
+                    {finalVersion.exemptions.length} 条
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
             <div className="flex items-start gap-3 rounded-md border border-slate-200 bg-white p-4 text-xs leading-5 text-slate-600">
               <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-              报告在客户端生成，不依赖后端。正式版本冻结后仍可在历史版本页比较工作副本与发布快照。
+              待确认项、最终版本与评审队列、发布页同源；正式版本冻结后仍可在历史版本页比较工作副本与发布快照。
             </div>
           </div>
         </div>
@@ -216,4 +244,13 @@ function downloadText(filename: string, content: string, type: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+function toneOf(
+  state: string,
+): 'green' | 'red' | 'blue' | 'amber' | 'neutral' {
+  if (state === 'accepted') return 'green';
+  if (state === 'returned') return 'red';
+  if (state === 'exemption') return 'blue';
+  return 'amber';
 }
