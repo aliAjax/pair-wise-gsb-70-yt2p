@@ -36,14 +36,15 @@ import {
   type ApiContract,
   type ContractStatus,
 } from '../models/contract';
-import { useContracts, useSaveContract } from '../services/contract-queries';
+import { getAllPendingItems } from '../models/review';
+import { useContracts, useCreateContract } from '../services/contract-queries';
 
 type StatusFilter = ContractStatus | 'all';
 
 export function DashboardPage() {
   const navigate = useNavigate();
   const contracts = useContracts();
-  const saveContract = useSaveContract();
+  const createContract = useCreateContract();
   const [query, setQuery] = useState('');
   const [domain, setDomain] = useState('all');
   const [status, setStatus] = useState<StatusFilter>('all');
@@ -72,18 +73,19 @@ export function DashboardPage() {
 
   const metrics = useMemo(() => {
     const data = contracts.data ?? [];
-    const pending = data.reduce(
-      (sum, contract) =>
-        sum + contract.changes.filter((change) => change.reviewState === 'pending').length,
-      0,
-    );
+    const pendingItems = getAllPendingItems(data);
     const breaking = data.reduce(
       (sum, contract) =>
         sum + contract.changes.filter((change) => change.compatibility === 'breaking').length,
       0,
     );
     const consumers = data.reduce((sum, contract) => sum + contract.consumers.length, 0);
-    return { pending, breaking, consumers, total: data.length };
+    return {
+      pending: pendingItems.length,
+      breaking,
+      consumers,
+      total: data.length,
+    };
   }, [contracts.data]);
 
   async function importContract() {
@@ -111,8 +113,10 @@ export function DashboardPage() {
         consumers: [],
         exemptions: [],
         versions: [],
+        revision: 1,
+        definitionVersion: 1,
       };
-      await saveContract.mutateAsync(contract);
+      await createContract.mutateAsync(contract);
       setImportText('');
       setImportOpen(false);
       await navigate({ to: '/contracts/$contractId', params: { contractId: contract.id } });
@@ -162,10 +166,10 @@ export function DashboardPage() {
               </Button>
               <Button
                 onClick={() => void importContract()}
-                disabled={!importText.trim() || saveContract.isPending}
+                disabled={!importText.trim() || createContract.isPending}
               >
                 <Upload className="h-4 w-4" />
-                {saveContract.isPending ? '导入中' : '创建契约'}
+                {createContract.isPending ? '导入中' : '创建契约'}
               </Button>
             </div>
           </DialogContent>
@@ -174,7 +178,7 @@ export function DashboardPage() {
 
       <section className="mb-5 grid gap-px overflow-hidden rounded-lg border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="管理契约" value={metrics.total} note="REST 接口定义" icon={Boxes} />
-        <Metric label="待评审变化" value={metrics.pending} note="需要逐条结论" icon={GitBranch} />
+        <Metric label="待确认项" value={metrics.pending} note="失效结论/待评审/调用方" icon={GitBranch} />
         <Metric
           label="不兼容变化"
           value={metrics.breaking}
@@ -252,9 +256,7 @@ export function DashboardPage() {
                 </thead>
                 <tbody>
                   {filtered.map((contract) => {
-                    const pending = contract.changes.filter(
-                      (change) => change.reviewState === 'pending',
-                    ).length;
+                    const pending = getAllPendingItems([contract]).length;
                     const breaking = contract.changes.filter(
                       (change) => change.compatibility === 'breaking',
                     ).length;
@@ -275,7 +277,7 @@ export function DashboardPage() {
                         <td className="px-4 py-4">
                           <div className="flex flex-wrap gap-1.5">
                             <Badge tone={pending ? 'amber' : 'green'}>
-                              {pending ? `${pending} 待评审` : '评审完成'}
+                              {pending ? `${pending} 待确认` : '可发布'}
                             </Badge>
                             {breaking > 0 && <Badge tone="red">{breaking} 不兼容</Badge>}
                           </div>

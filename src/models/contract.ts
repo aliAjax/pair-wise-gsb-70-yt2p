@@ -9,6 +9,18 @@ export type ChangeKind =
 export type Compatibility = 'compatible' | 'warning' | 'breaking';
 export type ReviewState = 'pending' | 'accepted' | 'returned' | 'exemption';
 
+/** 可并发编辑的四个区段，冲突检测与自动合并都以区段为粒度。 */
+export type EditSection = 'definition' | 'reviews' | 'consumers' | 'exemptions';
+
+export interface ConsumerConfirmation {
+  state: 'confirmed';
+  confirmedBy: string;
+  confirmedAt: string;
+  /** 确认所基于的定义版本，低于契约当前定义版本即视为失效。 */
+  definitionVersion: number;
+  comment: string;
+}
+
 export interface ContractChange {
   id: string;
   path: string;
@@ -24,6 +36,10 @@ export interface ContractChange {
   reviewer: string;
   reviewComment: string;
   reviewedAt?: string;
+  /** 结论基于的定义版本。 */
+  definitionVersion?: number;
+  /** 定义变更后旧结论被置为失效，等待重新确认。 */
+  invalidatedByDefinition?: boolean;
 }
 
 export interface ApiConsumer {
@@ -34,6 +50,7 @@ export interface ApiConsumer {
   clientVersion: string;
   requestsPerDay: number;
   contact: string;
+  confirmation?: ConsumerConfirmation;
 }
 
 export interface Exemption {
@@ -43,6 +60,11 @@ export interface Exemption {
   reason: string;
   approvedBy: string;
   expiresAt: string;
+  /** 登记时对应的定义版本；定义变更后豁免被作废（active=false），记录保留。 */
+  definitionVersion?: number;
+  active?: boolean;
+  voidedAt?: string;
+  voidReason?: string;
 }
 
 export interface ContractVersion {
@@ -54,6 +76,15 @@ export interface ContractVersion {
   notes: string;
   changeIds: string[];
   openapi: string;
+  /** 以下为不可变快照字段，发布时刻一次性固化，之后不再随工作副本变化。 */
+  definitionVersion?: number;
+  contractRevision?: number;
+  validChangeIds?: string[];
+  changes?: ContractChange[];
+  exemptions?: Exemption[];
+  consumers?: ApiConsumer[];
+  immutable?: boolean;
+  publishedBy?: string;
 }
 
 export interface ApiContract {
@@ -70,6 +101,12 @@ export interface ApiContract {
   consumers: ApiConsumer[];
   exemptions: Exemption[];
   versions: ContractVersion[];
+  /** 乐观锁修订号，每次写入 +1。 */
+  revision: number;
+  /** 契约定义版本，openapi 内容变化时 +1，并级联失效结论/豁免/调用方确认。 */
+  definitionVersion: number;
+  definitionUpdatedAt?: string;
+  lastEditedBy?: string;
 }
 
 export interface ReleaseIssue {
@@ -78,6 +115,7 @@ export interface ReleaseIssue {
   title: string;
   detail: string;
   changeId?: string;
+  consumerId?: string;
 }
 
 export const CHANGE_KIND_LABELS: Record<ChangeKind, string> = {
@@ -108,6 +146,13 @@ export const CONTRACT_STATUS_LABELS: Record<ContractStatus, string> = {
   ready: '待发布',
   released: '已发布',
   frozen: '已冻结',
+};
+
+export const SECTION_LABELS: Record<EditSection, string> = {
+  definition: '契约定义',
+  reviews: '逐条结论',
+  consumers: '调用方确认',
+  exemptions: '兼容层豁免',
 };
 
 export function classifyChange(input: {
@@ -161,61 +206,88 @@ export function classifyChange(input: {
   }
 }
 
-export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
-  const issues: ReleaseIssue[] = [];
-  const pending = contract.changes.filter((change) => change.reviewState === 'pending');
-  pending.forEach((change) => {
-    issues.push({
-      id: `pending-${change.id}`,
-      severity: 'blocker',
-      title: '存在未处理变更',
-      detail: `${change.method} ${change.path} 仍处于待评审状态。`,
-      changeId: change.id,
-    });
-  });
-
-  contract.changes
-    .filter((change) => change.reviewState !== 'exemption')
-    .forEach((change) => {
-      if (change.compatibility === 'compatible') {
-        return;
-      }
-      if (!change.impactStatement.trim()) {
-        issues.push({
-          id: `impact-${change.id}`,
-          severity: 'blocker',
-          title: '缺少调用方影响说明',
-          detail: `${change.path} 需要说明受影响调用方、流量和业务影响。`,
-          changeId: change.id,
-        });
-      }
-      if (!change.migrationPlan.trim()) {
-        issues.push({
-          id: `migration-${change.id}`,
-          severity: 'blocker',
-          title: '缺少迁移方案',
-          detail: `${change.path} 需要给出客户端升级、兼容层或回滚路径。`,
-          changeId: change.id,
-        });
-      }
-    });
-
-  contract.changes
-    .filter(
-      (change) =>
-        change.compatibility === 'breaking' &&
-        change.reviewState === 'accepted' &&
-        !contract.exemptions.some((item) => item.changeId === change.id),
-    )
-    .forEach((change) => {
-      issues.push({
-        id: `breaking-${change.id}`,
-        severity: 'warning',
-        title: '不兼容变更已接受但未登记豁免',
-        detail: `${change.path} 需要记录兼容层的范围、原因和到期时间。`,
-        changeId: change.id,
-      });
-    });
-
-  return issues;
+/** 结论是否因定义变更而失效，需要重新确认。 */
+export function isChangeStale(change: ContractChange, definitionVersion: number): boolean {
+  return (
+    change.invalidatedByDefinition === true ||
+    (change.definitionVersion ?? 1) < definitionVersion
+  );
 }
+
+/** 调用方是否尚未在当前定义版本上完成确认。 */
+export function isConsumerUnconfirmed(
+  consumer: ApiConsumer,
+  definitionVersion: number,
+): boolean {
+  const confirmation = consumer.confirmation;
+  return (
+    !confirmation ||
+    confirmation.state !== 'confirmed' ||
+    (confirmation.definitionVersion ?? 0) < definitionVersion
+  );
+}
+
+/** 豁免是否对当前定义版本仍然有效。 */
+export function isExemptionActive(exemption: Exemption, definitionVersion: number): boolean {
+  return (
+    exemption.active !== false &&
+    (exemption.definitionVersion ?? 1) >= definitionVersion
+  );
+}
+
+export function activeExemptions(contract: ApiContract): Exemption[] {
+  return contract.exemptions.filter((item) =>
+    isExemptionActive(item, contract.definitionVersion),
+  );
+}
+
+export function validChanges(contract: ApiContract): ContractChange[] {
+  return contract.changes.filter(
+    (change) =>
+      change.reviewState !== 'pending' &&
+      !isChangeStale(change, contract.definitionVersion),
+  );
+}
+
+/**
+ * 把旧版本（或种子数据）补齐并发控制所需字段。读取时统一归一化，
+ * 保证模型里 revision / definitionVersion 始终可用。
+ */
+export function normalizeContract(input: Partial<ApiContract> & { id: string }): ApiContract {
+  const definitionVersion = input.definitionVersion ?? 1;
+  const normalized: ApiContract = {
+    id: input.id,
+    name: input.name ?? input.id,
+    version: input.version ?? '0.0.0',
+    domain: input.domain ?? '未分类',
+    owner: input.owner ?? '未指派',
+    protocol: input.protocol ?? 'REST',
+    status: input.status ?? 'draft',
+    updatedAt: input.updatedAt ?? new Date().toISOString(),
+    openapi: input.openapi ?? '',
+    changes: [],
+    consumers: [],
+    exemptions: [],
+    versions: [],
+    revision: input.revision ?? 1,
+    definitionVersion,
+    definitionUpdatedAt: input.definitionUpdatedAt,
+    lastEditedBy: input.lastEditedBy,
+  };
+  Object.assign(normalized, input, { revision: normalized.revision, definitionVersion });
+  normalized.changes = (input.changes ?? []).map((change) => ({
+    ...change,
+    definitionVersion: change.definitionVersion ?? definitionVersion,
+    invalidatedByDefinition: change.invalidatedByDefinition ?? false,
+  }));
+  normalized.consumers = (input.consumers ?? []).map((consumer) => ({ ...consumer }));
+  normalized.exemptions = (input.exemptions ?? []).map((item) => ({
+    ...item,
+    active: item.active ?? true,
+    definitionVersion: item.definitionVersion ?? definitionVersion,
+  }));
+  normalized.versions = (input.versions ?? []).map((version) => ({ ...version }));
+  return normalized;
+}
+
+export { validateForRelease } from './review';

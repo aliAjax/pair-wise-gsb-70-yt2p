@@ -112,7 +112,7 @@ const userOpenApi = openApi('用户权限 API', '1.14.0', [
   },
 ]);
 
-export const seedContracts: ApiContract[] = [
+export const seedContracts = [
   {
     id: 'contract-order',
     name: '订单履约 API',

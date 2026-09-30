@@ -6,7 +6,12 @@ import {
   LayoutDashboard,
   Network,
   PackageCheck,
+  UserRound,
 } from 'lucide-react';
+import { useState } from 'react';
+import { ConflictDialog } from '../conflict/conflict-dialog';
+import { NoticeToast } from '../conflict/notice-toast';
+import { useIdentityStore } from '../../store/identity-store';
 import { cn } from '../../lib/utils';
 
 const navigation = [
@@ -18,9 +23,14 @@ const navigation = [
 
 export function AppShell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const editor = useIdentityStore((state) => state.editor);
+  const setEditor = useIdentityStore((state) => state.setEditor);
+  const [editingName, setEditingName] = useState(false);
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
+      <ConflictDialog />
+      <NoticeToast />
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 border-r border-slate-800 bg-slate-950 text-slate-100 lg:flex lg:flex-col">
         <div className="flex h-16 items-center gap-3 border-b border-slate-800 px-5">
           <div className="grid h-9 w-9 place-items-center rounded-md border border-sky-700 bg-sky-950">
@@ -76,8 +86,37 @@ export function AppShell() {
               正式版本发布前执行兼容性门禁、调用方影响确认与迁移方案检查
             </div>
             <div className="flex items-center gap-2">
+              {editingName ? (
+                <input
+                  className="h-7 w-32 rounded-sm border border-slate-300 px-2 text-xs outline-none focus:border-sky-500"
+                  defaultValue={editor}
+                  autoFocus
+                  // eslint-disable-next-line jsx-a11y/no-autofocus
+                  onBlur={(event) => {
+                    setEditor(event.target.value);
+                    setEditingName(false);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      setEditor((event.target as HTMLInputElement).value);
+                      setEditingName(false);
+                    }
+                    if (event.key === 'Escape') setEditingName(false);
+                  }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setEditingName(true)}
+                  className="flex items-center gap-1.5 rounded-sm border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:border-sky-300 hover:text-sky-800"
+                  title="点击切换评审人身份（模拟两位评审人各开一个标签页）"
+                >
+                  <UserRound className="h-3.5 w-3.5" />
+                  {editor}
+                </button>
+              )}
               <span className="h-2 w-2 rounded-full bg-emerald-500" />
-              <span className="text-xs text-slate-600">评审服务正常</span>
+              <span className="hidden text-xs text-slate-600 sm:inline">评审服务正常</span>
             </div>
           </div>
           <nav

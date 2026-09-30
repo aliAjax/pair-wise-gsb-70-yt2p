@@ -1,5 +1,6 @@
 import { Download, FileJson, FileText, ShieldCheck } from 'lucide-react';
 import { useMemo } from 'react';
+import { PendingSummary } from '../components/contract/pending-summary';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -11,6 +12,14 @@ import {
   SelectValue,
 } from '../components/ui/select';
 import { formatDateTime } from '../lib/utils';
+import {
+  isChangeStale,
+  isConsumerUnconfirmed,
+} from '../models/contract';
+import {
+  getAllPendingItems,
+  pendingSummary,
+} from '../models/review';
 import { buildChangeReport } from '../services/contract-service';
 import { useContracts } from '../services/contract-queries';
 import { useReviewStore } from '../store/review-store';
@@ -24,7 +33,11 @@ export function ReportsPage() {
     contracts.data?.[0];
 
   const report = useMemo(() => (contract ? buildChangeReport(contract) : ''), [contract]);
-  const reviewed = contract?.changes.filter((change) => change.reviewState !== 'pending') ?? [];
+  const summary = contract ? pendingSummary(contract) : null;
+  const allPending = useMemo(
+    () => getAllPendingItems(contracts.data ?? []),
+    [contracts.data],
+  );
 
   return (
     <div>
@@ -35,7 +48,7 @@ export function ReportsPage() {
             契约变更报告
           </h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-            汇总接口差异、兼容性结论、调用方影响、迁移方案和兼容层豁免，供发布评审归档。
+            待确认项与评审队列、发布门禁同源；报告标注失效结论、调用方确认状态和有效豁免，供发布评审归档。
           </p>
         </div>
         {contract && (
@@ -88,11 +101,12 @@ export function ReportsPage() {
             </SelectContent>
           </Select>
           {contract && (
-            <div className="flex flex-wrap gap-2 sm:ml-auto">
-              <Badge tone="blue">{contract.domain}</Badge>
-              <Badge tone="neutral">{contract.changes.length} 个变化</Badge>
-              <Badge tone={reviewed.length === contract.changes.length ? 'green' : 'amber'}>
-                {reviewed.length === contract.changes.length ? '评审完成' : '仍有待评审项'}
+            <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+              <Badge tone="blue">定义第 {contract.definitionVersion} 版</Badge>
+              <Badge tone={summary && summary.total === 0 ? 'green' : 'amber'}>
+                {summary && summary.total === 0
+                  ? '待确认项已清空'
+                  : `${summary?.total ?? 0} 项待确认`}
               </Badge>
             </div>
           )}
@@ -119,27 +133,72 @@ export function ReportsPage() {
           <div className="space-y-4">
             <Card>
               <CardHeader>
+                <CardTitle>同源待确认项</CardTitle>
+                <p className="mt-1 text-xs text-slate-500">
+                  全局共 {allPending.length} 项；当前契约 {summary?.total ?? 0} 项
+                </p>
+              </CardHeader>
+              <CardContent>
+                <PendingSummary contract={contract} />
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
                 <CardTitle>豁免记录</CardTitle>
                 <p className="mt-1 text-xs text-slate-500">
-                  兼容层范围、原因和到期时间会进入正式报告
+                  仅有效豁免会进入发布快照；定义变更后失效的豁免保留记录但标注作废
                 </p>
               </CardHeader>
               <CardContent className="space-y-3">
-                {contract.exemptions.map((exemption) => (
-                  <article
-                    key={exemption.id}
-                    className="rounded-md border border-blue-200 bg-blue-50 p-3"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <strong className="text-sm text-blue-950">{exemption.scope}</strong>
-                      <Badge tone="blue">至 {exemption.expiresAt}</Badge>
-                    </div>
-                    <p className="mt-2 text-xs leading-5 text-blue-900">{exemption.reason}</p>
-                    <div className="mt-2 text-[11px] text-blue-800">
-                      批准人：{exemption.approvedBy}
-                    </div>
-                  </article>
-                ))}
+                {contract.exemptions.map((exemption) => {
+                  const active =
+                    exemption.active !== false &&
+                    (exemption.definitionVersion ?? 1) >= contract.definitionVersion;
+                  return (
+                    <article
+                      key={exemption.id}
+                      className={
+                        active
+                          ? 'rounded-md border border-blue-200 bg-blue-50 p-3'
+                          : 'rounded-md border border-slate-200 bg-slate-50 p-3'
+                      }
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <strong
+                          className={
+                            active ? 'text-sm text-blue-950' : 'text-sm text-slate-500 line-through'
+                          }
+                        >
+                          {exemption.scope}
+                        </strong>
+                        <Badge tone={active ? 'blue' : 'neutral'}>
+                          {active ? `至 ${exemption.expiresAt}` : '已作废'}
+                        </Badge>
+                      </div>
+                      <p
+                        className={
+                          active
+                            ? 'mt-2 text-xs leading-5 text-blue-900'
+                            : 'mt-2 text-xs leading-5 text-slate-400'
+                        }
+                      >
+                        {exemption.reason}
+                      </p>
+                      <div
+                        className={
+                          active
+                            ? 'mt-2 text-[11px] text-blue-800'
+                            : 'mt-2 text-[11px] text-slate-400'
+                        }
+                      >
+                        批准人：{exemption.approvedBy} · 第 {exemption.definitionVersion ?? 1}{' '}
+                        版定义
+                        {!active && exemption.voidReason ? ` · ${exemption.voidReason}` : ''}
+                      </div>
+                    </article>
+                  );
+                })}
                 {!contract.exemptions.length && (
                   <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
                     当前没有兼容层豁免。
@@ -150,7 +209,7 @@ export function ReportsPage() {
 
             <Card>
               <CardHeader>
-                <CardTitle>评审签名</CardTitle>
+                <CardTitle>评审签名与调用方确认</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
                 {contract.changes.map((change) => (
@@ -163,23 +222,27 @@ export function ReportsPage() {
                         {change.method} {change.path}
                       </div>
                       <div className="mt-1 text-xs text-slate-500">
-                        {change.reviewer || '尚未评审'}
+                        {change.reviewer || '尚未评审'}（第 {change.definitionVersion ?? 1} 版）
                       </div>
                     </div>
                     <div className="text-right">
-                      <Badge
-                        tone={
-                          change.reviewState === 'accepted'
-                            ? 'green'
-                            : change.reviewState === 'returned'
-                              ? 'red'
-                              : change.reviewState === 'exemption'
-                                ? 'blue'
-                                : 'amber'
-                        }
-                      >
-                        {change.reviewState}
-                      </Badge>
+                      {isChangeStale(change, contract.definitionVersion) ? (
+                        <Badge tone="amber">失效待重新确认</Badge>
+                      ) : (
+                        <Badge
+                          tone={
+                            change.reviewState === 'accepted'
+                              ? 'green'
+                              : change.reviewState === 'returned'
+                                ? 'red'
+                                : change.reviewState === 'exemption'
+                                  ? 'blue'
+                                  : 'amber'
+                          }
+                        >
+                          {change.reviewState}
+                        </Badge>
+                      )}
                       {change.reviewedAt && (
                         <div className="mt-1 text-[10px] text-slate-400">
                           {formatDateTime(change.reviewedAt)}
@@ -188,12 +251,35 @@ export function ReportsPage() {
                     </div>
                   </div>
                 ))}
+                <div className="border-t border-slate-200 pt-3">
+                  {contract.consumers.map((consumer) => {
+                    const unconfirmed = isConsumerUnconfirmed(
+                      consumer,
+                      contract.definitionVersion,
+                    );
+                    return (
+                      <div
+                        key={consumer.id}
+                        className="flex items-center justify-between gap-2 py-1.5 text-xs"
+                      >
+                        <span className="text-slate-600">{consumer.name}</span>
+                        {unconfirmed ? (
+                          <Badge tone="red">待确认</Badge>
+                        ) : (
+                          <Badge tone="green">
+                            已确认 · {consumer.confirmation?.confirmedBy}
+                          </Badge>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </CardContent>
             </Card>
 
             <div className="flex items-start gap-3 rounded-md border border-slate-200 bg-white p-4 text-xs leading-5 text-slate-600">
               <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-              报告在客户端生成，不依赖后端。正式版本冻结后仍可在历史版本页比较工作副本与发布快照。
+              正式版本发布后，归档报告来自不可变快照，与当前工作副本的后续修改互不影响。
             </div>
           </div>
         </div>
